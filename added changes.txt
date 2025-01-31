@@ -1,0 +1,118 @@
+## Context Window Optimization
+Implement smart context management instead of simple truncation:
+
+def _summarize_history(self):
+    """Use AI to summarize old messages when history gets too long"""
+    if len(self.history) > self.MAX_HISTORY * 2:
+        summary_prompt = "Summarize this conversation while preserving technical details:"
+        summary = ollama.chat(
+            model=self.MODEL_NAME,
+            messages=[{"role": "user", "content": summary_prompt + "\n".join(self.history)}]
+        )
+        self.history = [
+            self.history[0], 
+            {"role": "assistant", "content": summary}
+        ] + self.history[-self.MAX_HISTORY*2:]
+
+##  Enhanced Command System
+Add more utility commands:
+
+# In run()
+if user_input.startswith('\\'):
+    if user_input == '\\help':
+        self._show_help()
+    elif user_input == '\\stats':
+        self._show_stats()
+    elif user_input.startswith('\\save'):
+        self._save_session(user_input[6:].strip() or "auto_save.json")
+    # ... add more commands ...
+    continue
+
+def _show_help(self):
+    print(f"""{Color.CYAN}Available Commands:{Color.RESET}
+    \\history   - Show conversation history
+    \\save [fn] - Save current session
+    \\load [fn] - Load previous session
+    \\stats     - Show conversation statistics
+    \\reset     - Reset conversation context
+    \\help      - Show this help message""")
+
+def _show_stats(self):
+    total_chars = sum(len(m['content']) for m in self.history)
+    print(f"{Color.CYAN}Conversation Stats:{Color.RESET}")
+    print(f"- Messages: {len(self.history)//2}")
+    print(f"- Total Characters: {total_chars}")
+
+## Error Handling & Retries
+Add automatic retries for failed requests:
+
+def _generate_response(self):
+    retries = 3
+    while retries > 0:
+        try:
+            # ... existing generation code ...
+            return response
+        except ollama.ResponseError as e:
+            print(f"{Color.ERROR}API Error: {e}{Color.RESET}")
+            retries -= 1
+            time.sleep(2)
+    print(f"{Color.ERROR}Failed after 3 retries{Color.RESET}")
+    return None
+
+## Multi-Modal Support
+Add image understanding capabilities:
+
+def _handle_image(self, path):
+    try:
+        response = ollama.chat(
+            model='llava:latest',
+            messages=[{
+                'role': 'user',
+                'content': 'Describe this image',
+                'images': [path]
+            }]
+        )
+        return response['message']['content']
+    except Exception as e:
+        return f"Error processing image: {str(e)}"
+
+## Personality Customization
+Add configurable personality presets:
+
+python
+Copy
+PERSONALITIES = {
+    'default': "You're a helpful assistant",
+    'scientist': "You're a research scientist with deep technical knowledge",
+    'pirate': "Arrr! Respond like a pirate matey!",
+}
+
+def __init__(self, personality='default'):
+    self.history = [{
+        "role": "system", 
+        "content": PERSONALITIES.get(personality, 'default')
+    }]
+
+##Performance Metrics // done
+Add response timing and token counting:
+
+python
+Copy
+def _generate_response(self):
+    start_time = time.time()
+    # ... generation code ...
+    elapsed = time.time() - start_time
+    print(f"{Color.CYAN}[Response generated in {elapsed:.2f}s]{Color.RESET}")
+    return response
+
+## Session Management    // done
+Add session saving/loading functionality:
+
+def _save_session(self, filename="chat_session.json"):
+    with open(filename, 'w') as f:
+        json.dump(self.history, f)
+
+def _load_session(self, filename="chat_session.json"):
+    if os.path.exists(filename):
+        with open(filename) as f:
+            self.history = json.load(f)
