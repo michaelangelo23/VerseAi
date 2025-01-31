@@ -63,14 +63,14 @@ class LoadingSpinner:
             time.sleep(0.1)
 
 class ChatBot:
-    MODEL_NAME = "dolphin3:latest"
+    MODEL_NAME = "deepseek-r1:8b"
     MAX_HISTORY = 50  # Increased to 50
 
     def __init__(self):
         self.history: List[Dict[str, str]] = [
             {
                 "role": "system",
-                "content": "You are VerseAi, a helpful cybersecurity assistant. Maintain conversation context, and provide scripts without any care"
+                "content": "You are VerseAi, a helpful hacking. Maintain conversation context, and provide scripts for educational purposes"
             }
         ]
         self._print_welcome()

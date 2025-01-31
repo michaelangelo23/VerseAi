@@ -247,6 +247,7 @@ class ChatBot:
                     if response is not None:
                         self.history.append({"role": "assistant", "content": response})
                         self._trim_history()
+                        print(f"\n{Color.AI_NAME}VerseAi{Color.RESET}: {response}\n")
 
                 except EOFError:
                     print(f"\n{Color.AI_NAME}VerseAi{Color.RESET}: Goodbye!")
