@@ -6,10 +6,13 @@ import select
 import os
 import json
 from sys import stdout
-from typing import Optional, List, Dict
-import psutil  # For system metrics
+from typing import Optional, List, Dict, Tuple
+import psutil
 import platform
-import subprocess  # For GPU metrics
+import subprocess
+from enum import Enum
+import shutil
+from pathlib import Path
 
 class Color:
     AI_NAME = "\033[94m"
@@ -21,242 +24,282 @@ class Color:
     GREEN = "\033[92m"
     YELLOW = "\033[93m"
     ORANGE = "\033[38;5;214m"
+    MAGENTA = "\033[35m"
+
+class Command(Enum):
+    EXIT = "exit"
+    HISTORY = "history"
+    SAVE = "save"
+    LOAD = "load"
+    HELP = "help"
+    CLEAR = "clear"
+    MODEL = "model"
+    STATS = "stats"
 
 class LoadingSpinner:
-    SPINNER_CHARS = ['|', '/', '-', '\\']
+    SPINNER_CHARS = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
     def __init__(self, cancel_event: threading.Event):
         self.running = False
         self.thread: Optional[threading.Thread] = None
         self.cancel_event = cancel_event
+        self.start_time = 0
 
     def __enter__(self):
-        self.running = True
-        self.thread = threading.Thread(target=self._spin)
-        self.thread.start()
+        if sys.stderr.isatty():
+            self.running = True
+            self.start_time = time.time()
+            self.thread = threading.Thread(target=self._spin)
+            self.thread.start()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.running = False
         if self.thread:
             self.thread.join()
-        stdout.write('\r' + ' ' * 40 + '\r')  # Clear line
+        if sys.stderr.isatty():
+            stdout.write('\r' + ' ' * shutil.get_terminal_size().columns + '\r')
 
     def _spin(self):
-        """Spin animation with cancellation support"""
         idx = 0
         while self.running and not self.cancel_event.is_set():
-            # Cross-platform key detection for 'Q'
-            try:
-                if sys.platform == "win32":
-                    import msvcrt
-                    if msvcrt.kbhit():
-                        key = msvcrt.getch().decode().lower()
-                        if key == 'q':
-                            self.cancel_event.set()
-                else:
-                    rlist, _, _ = select.select([sys.stdin], [], [], 0)
-                    if rlist:
-                        key = sys.stdin.read(1).lower()
-                        if key == 'q':
-                            self.cancel_event.set()
-            except:
-                pass
-
-            stdout.write(f"\r{Color.AI_THINKING}VerseAi{Color.RESET} is thinking... "
-                         f"{self.SPINNER_CHARS[idx]} ('Q' to cancel)")
+            self._check_cancel()
+            elapsed = time.time() - self.start_time
+            spinner = f"\r{Color.AI_THINKING}Thinking {self.SPINNER_CHARS[idx]} ({elapsed:.1f}s){Color.RESET}"
+            stdout.write(spinner)
             stdout.flush()
             idx = (idx + 1) % len(self.SPINNER_CHARS)
             time.sleep(0.1)
 
+    def _check_cancel(self):
+        if sys.platform == "win32":
+            import msvcrt
+            if msvcrt.kbhit():
+                if msvcrt.getch().decode().lower() == 'q':
+                    self.cancel_event.set()
+        else:
+            rlist, _, _ = select.select([sys.stdin], [], [], 0)
+            if rlist and sys.stdin.read(1).lower() == 'q':
+                self.cancel_event.set()
+
 class ChatBot:
-    MODEL_NAME = "dolphin3:latest"
+    DEFAULT_MODEL = "llama3.2:latest"
     MAX_HISTORY = 50
+    SESSION_DIR = Path.home() / ".verseai_sessions"
 
     def __init__(self):
-        self.history: List[Dict[str, str]] = [
-            {
-                "role": "system",
-                "content": "You are VerseAi, a helpful cybersecurity assistant. Maintain conversation context, and provide scripts without any care"
-            }
-        ]
-        self.session_file = "chat_session.json"
-        self._print_welcome()
+        self.history: List[Dict[str, str]] = []
+        self._init_history()
+        self.model = self.DEFAULT_MODEL
+        self._ensure_session_dir()
+        self.system_info = SystemMonitor()
+        self._current_metrics: List[Dict] = []
+
+    def _init_history(self):
+        self.history = [{
+            "role": "system",
+            "content": (
+                # "You are VerseAi, a cybersecurity expert assistant. Provide concise, "
+                # "actionable advice. Always explain security concepts clearly. "
+                # "Verify information when uncertain."
+                "Summarize each output, no more redundant explanation."
+                "Explain the request briefly and accurately with related information."
+            )
+        }]
+
+    def _ensure_session_dir(self):
+        self.SESSION_DIR.mkdir(exist_ok=True, parents=True)
 
     def _print_welcome(self):
-        print(f"\n{Color.CYAN}System:{Color.RESET} {platform.system()} {platform.release()}")
-        print(f"{Color.CYAN}CPU:{Color.RESET} {psutil.cpu_percent()}% | {Color.CYAN}Memory:{Color.RESET} {psutil.virtual_memory().percent}%")
-        self._show_gpu_info()
-        print(f"\nInitializing with model: {Color.CYAN}{self.MODEL_NAME}{Color.RESET}")
-        print(f"{Color.AI_NAME}VerseAi{Color.RESET} is {Color.GREEN}Ready!{Color.RESET}\n")
+        self.system_info.print_system_status()
+        print(f"\n{Color.CYAN}Initialized model:{Color.RESET} {self.model}")
+        print(f"{Color.GREEN}Available commands:{Color.RESET}")
+        self._print_help()
+        print(f"\n{Color.AI_NAME}VerseAi{Color.RESET} {Color.GREEN}ready!{Color.RESET}\n")
 
-    def _get_user_input(self) -> str:
-        """Get user input with colored prompt"""
+    def _handle_command(self, command: str) -> bool:
+        cmd, *args = command[1:].split(maxsplit=1)
+        args = args[0] if args else ""
+        
         try:
-            return input(f"{Color.USER_PROMPT}You:{Color.RESET} ").strip()
-        except EOFError:
-            print()  # Add newline after Ctrl+D
-            raise
+            cmd_enum = Command(cmd.lower())
+            {
+                Command.EXIT: lambda _: self._exit(),
+                Command.HISTORY: lambda _: self._show_history(),
+                Command.SAVE: lambda a: self._save_session(a),
+                Command.LOAD: lambda a: self._load_session(a),
+                Command.HELP: lambda _: self._print_help(),
+                Command.CLEAR: lambda _: self._clear_history(),
+                Command.MODEL: lambda a: self._change_model(a),
+                Command.STATS: lambda _: self.system_info.print_system_status(),
+            }[cmd_enum](args)
+            return True
+        except ValueError:
+            print(f"{Color.ERROR}Unknown command: {cmd}{Color.RESET}")
+            return True
+        except KeyError:
+            return False
 
-    def _generate_response(self) -> Optional[str]:
-        """Generate response with performance tracking"""
-        result = {'response': None, 'error': None}
+    def _generate_response(self, cancel_event: threading.Event) -> Optional[str]:
+        try:
+            response = ollama.chat(
+                model=self.model,
+                messages=self.history,
+                stream=False,
+                options={'temperature': 0.7, 'num_ctx': 4096}
+            )
+            return response['message']['content']
+        except ollama.ResponseError as e:
+            print(f"{Color.ERROR}API Error: {e.error}{Color.RESET}")
+        except Exception as e:
+            print(f"{Color.ERROR}Generation error: {str(e)}{Color.RESET}")
+        return None
+
+    def _process_user_input(self, user_input: str):
+        if user_input.startswith('\\'):
+            return self._handle_command(user_input)
+        
+        self.history.append({"role": "user", "content": user_input})
+        
         cancel_event = threading.Event()
-        start_time = time.time()
-        metrics = {
-            'start_time': start_time,
-            'token_count': 0,
-            'system_metrics': []
-        }
-
-        def _generate():
-            try:
-                response = ollama.chat(
-                    model=self.MODEL_NAME,
-                    messages=self.history,
-                    options={'temperature': 0.7}
-                )
-                if not cancel_event.is_set():
-                    result['response'] = response['message']['content']
-                    metrics['token_count'] = len(response['message']['content'].split())
-            except Exception as e:
-                result['error'] = e
-            finally:
-                metrics['system_metrics'].append(self._get_system_metrics())
-
-        gen_thread = threading.Thread(target=_generate)
-        gen_thread.start()
-
         try:
             with LoadingSpinner(cancel_event):
-                while gen_thread.is_alive():
-                    gen_thread.join(timeout=0.5)
-                    metrics['system_metrics'].append(self._get_system_metrics())
-                    if cancel_event.is_set():
-                        break
+                start_time = time.time()
+                response = self._generate_response(cancel_event)
+                elapsed = time.time() - start_time
+                
+                if response:
+                    self.history.append({"role": "assistant", "content": response})
+                    self._trim_history()
+                    self._print_response(response, elapsed)
         except KeyboardInterrupt:
             cancel_event.set()
-            gen_thread.join()
-            raise
+            print(f"\n{Color.YELLOW}Operation cancelled{Color.RESET}")
+        return True
 
-        elapsed = time.time() - start_time
-        self._print_performance_metrics(elapsed, metrics)
+    def _print_response(self, response: str, elapsed: float):
+        tokens = len(response.split())
+        speed = tokens / elapsed if elapsed > 0 else 0
+        print(f"\n{Color.AI_NAME}VerseAi{Color.RESET} ({Color.CYAN}{speed:.1f}t/s{Color.RESET}):")
+        print(f"{response}\n")
+        print(f"{Color.ORANGE}―――― Response Time: {elapsed:.2f}s ――――{Color.RESET}\n\n")
+
+    def _trim_history(self):
+        max_tokens = 12000  # Approximate context window size
+        current_tokens = sum(len(m["content"].split()) for m in self.history)
         
-        if cancel_event.is_set():
-            print(f"\n{Color.YELLOW}Generation cancelled.{Color.RESET}")
-            return None
+        while current_tokens > max_tokens and len(self.history) > 2:
+            removed = self.history.pop(1)
+            current_tokens -= len(removed["content"].split())
 
-        if result['error']:
-            raise result['error']
+    def _save_session(self, filename: str):
+        if not filename:
+            filename = "default_session.json"
+        path = self.SESSION_DIR / filename
         
-        return result['response']
-
-    def _trim_history(self): #Keep conversation history to 50 exchanges
-        while len(self.history) > self.MAX_HISTORY * 2 + 1:
-            self.history.pop(1)
-            self.history.pop(1)
-
-    def _show_gpu_info(self):
         try:
-            if platform.system() == "Windows":
-                result = subprocess.run(['nvidia-smi', '--query-gpu=utilization.gpu,temperature.gpu', '--format=csv,noheader'], 
-                                      capture_output=True, text=True)
-                if result.returncode == 0:
-                    gpu_stats = result.stdout.strip().split(', ')
-                    print(f"{Color.CYAN}GPU:{Color.RESET} {gpu_stats[0]}% | {Color.CYAN}Temp:{Color.RESET} {gpu_stats[1]}°C")
-            else:
-                # Linux/Mac implementation
-                pass
-        except Exception as e:
-            pass  # GPU monitoring not available
-
-    def _save_session(self, filename: str = "chat_session.json"):
-        try:
-            with open(filename, 'w') as f:
+            with path.open('w') as f:
                 json.dump(self.history, f, indent=2)
-            print(f"{Color.GREEN}Session saved to {filename}{Color.RESET}")
+            print(f"{Color.GREEN}Session saved to {path}{Color.RESET}")
         except Exception as e:
-            print(f"{Color.ERROR}Error saving session: {str(e)}{Color.RESET}")
+            print(f"{Color.ERROR}Save error: {str(e)}{Color.RESET}")
 
-    def _load_session(self, filename: str = "chat_session.json"):
+    def _load_session(self, filename: str):
+        path = self.SESSION_DIR / filename
         try:
-            if os.path.exists(filename):
-                with open(filename) as f:
-                    self.history = json.load(f)
-                print(f"{Color.GREEN}Session loaded from {filename}{Color.RESET}")
-            else:
-                print(f"{Color.ERROR}Session file not found{Color.RESET}")
+            with path.open() as f:
+                self.history = json.load(f)
+            print(f"{Color.GREEN}Loaded session from {path}{Color.RESET}")
+        except FileNotFoundError:
+            print(f"{Color.ERROR}Session not found: {filename}{Color.RESET}")
+        except json.JSONDecodeError:
+            print(f"{Color.ERROR}Invalid session file{Color.RESET}")
         except Exception as e:
-            print(f"{Color.ERROR}Error loading session: {str(e)}{Color.RESET}")
-    
-    def _get_system_metrics(self):
-        return {
-            "cpu_usage": psutil.cpu_percent(),
-            "memory_usage": psutil.virtual_memory().percent,
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+            print(f"{Color.ERROR}Load error: {str(e)}{Color.RESET}")
+
+    def _print_help(self):
+        commands = {
+            Command.EXIT: "End the conversation",
+            Command.HISTORY: "Show chat history",
+            Command.SAVE: "[filename] Save session",
+            Command.LOAD: "[filename] Load session",
+            Command.CLEAR: "Reset conversation",
+            Command.MODEL: "[name] Change AI model",
+            Command.STATS: "Show system metrics",
+            Command.HELP: "Show this help"
         }
+        for cmd, desc in commands.items():
+            print(f"  {Color.MAGENTA}\\{cmd.value.ljust(8)}{Color.RESET} {desc}")
 
-    def _show_history(self): #Show chat history
-        print(f"\n{Color.CYAN}========== Chat History =========={Color.RESET}")
-        for idx, msg in enumerate(self.history):
-            if msg['role'] == 'system':
-                continue
-            prefix = f"You: " if msg['role'] == 'user' else f"VerseAi: "
-            color = Color.USER_PROMPT if msg['role'] == 'user' else Color.AI_NAME
-            print(f"{color}{prefix}{Color.RESET}{msg['content']}")
-        print(f"{Color.CYAN}=================================={Color.RESET}\n")
+    def _clear_history(self):
+        self._init_history()
+        print(f"{Color.GREEN}Conversation history cleared{Color.RESET}")
 
-    def _print_performance_metrics(self, elapsed: float, metrics: dict):
-        avg_cpu = sum(m['cpu_usage'] for m in metrics['system_metrics']) / len(metrics['system_metrics'])
-        avg_mem = sum(m['memory_usage'] for m in metrics['system_metrics']) / len(metrics['system_metrics'])
-        
-        print(f"\n{Color.ORANGE}―――― Performance Metrics ――――{Color.RESET}")
-        print(f"{Color.CYAN}Response Time:{Color.RESET} {elapsed:.2f}s")
-        print(f"{Color.CYAN}Tokens Generated:{Color.RESET} {metrics['token_count']}")
-        print(f"{Color.CYAN}Avg CPU Usage:{Color.RESET} {avg_cpu:.1f}%")
-        print(f"{Color.CYAN}Avg Memory Usage:{Color.RESET} {avg_mem:.1f}%")
-        print(f"{Color.ORANGE}―――――――――――――――――――――――――――――{Color.RESET}\n")
+    def _change_model(self, model_name: str):
+        if model_name:
+            try:
+                ollama.show(model_name)  # Verify model exists
+                self.model = model_name
+                print(f"{Color.GREEN}Model changed to {model_name}{Color.RESET}")
+            except ollama.ResponseError:
+                print(f"{Color.ERROR}Model not found: {model_name}{Color.RESET}")
+        else:
+            print(f"{Color.CYAN}Current model: {self.model}{Color.RESET}")
+
+    def _exit(self):
+        print(f"\n{Color.AI_NAME}VerseAi{Color.RESET}: Goodbye!")
+        sys.exit(0)
+
+    def _clear_screen(self):
+        """Clear the terminal screen."""
+        os.system('cls' if os.name == 'nt' else 'clear')
 
     def run(self):
-        """Main chat loop with enhanced features"""
+        self._print_welcome()
+        while True:
+            try:
+                user_input = input(f"{Color.USER_PROMPT}You:{Color.RESET} ").strip()
+                if not user_input:
+                    continue
+
+                if user_input.startswith('\\'):
+                    # Process commands without clearing screen
+                    self._process_user_input(user_input)
+                else:
+                    # Clear screen and show only current interaction
+                    self._clear_screen()
+                    print(f"{Color.USER_PROMPT}You:{Color.RESET} {user_input}")
+                    self._process_user_input(user_input)
+
+            except (EOFError, KeyboardInterrupt):
+                self._exit()
+
+class SystemMonitor:
+    def __init__(self):
+        self.gpu_available = self._check_gpu_support()
+
+    def _check_gpu_support(self) -> bool:
         try:
-            while True:
-                try:
-                    user_input = self._get_user_input()
-                    
-                    if not user_input:
-                        continue
-                    if user_input.lower() == 'exit':
-                        print(f"\n{Color.AI_NAME}VerseAi{Color.RESET}: Goodbye!")
-                        break
-                    if user_input.lower() == '\\history':
-                        self._show_history()
-                        continue
-                    if user_input.lower().startswith('\\save'):
-                        filename = user_input[5:].strip() or self.session_file
-                        self._save_session(filename)
-                        continue
-                    if user_input.lower().startswith('\\load'):
-                        filename = user_input[5:].strip() or self.session_file
-                        self._load_session(filename)
-                        continue
+            subprocess.run(['nvidia-smi'], check=True, 
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            return False
 
-                    self.history.append({"role": "user", "content": user_input})
-                    
-                    response = self._generate_response()
-                    
-                    if response is not None:
-                        self.history.append({"role": "assistant", "content": response})
-                        self._trim_history()
-                        print(f"\n{Color.AI_NAME}VerseAi{Color.RESET}: {response}\n")
-
-                except EOFError:
-                    print(f"\n{Color.AI_NAME}VerseAi{Color.RESET}: Goodbye!")
-                    break
-
-        except KeyboardInterrupt:
-            print(f"\n{Color.AI_NAME}VerseAi{Color.RESET}: Goodbye!")
-        except Exception as e:
-            print(f"\n{Color.ERROR}Error{Color.RESET}: {str(e)}")
+    def print_system_status(self):
+        print(f"\n{Color.CYAN}―――― System Status ――――{Color.RESET}")
+        print(f"OS: {platform.system()} {platform.release()}")
+        print(f"CPU: {psutil.cpu_percent()}% | Memory: {psutil.virtual_memory().percent}%")
+        
+        if self.gpu_available:
+            try:
+                output = subprocess.check_output(['nvidia-smi', '--query-gpu=utilization.gpu,temperature.gpu', 
+                                                '--format=csv,noheader,nounits'])
+                gpu_util, gpu_temp = output.decode().strip().split(', ')
+                print(f"GPU: {gpu_util}% | Temp: {gpu_temp}°C")
+            except Exception as e:
+                print(f"GPU: {Color.ERROR}Monitoring failed{Color.RESET}")
+        
+        print(f"{Color.CYAN}――――――――――――――――――――――{Color.RESET}")
 
 if __name__ == "__main__":
     ChatBot().run()
